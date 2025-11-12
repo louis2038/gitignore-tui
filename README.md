@@ -33,6 +33,14 @@ This will compile and install the binary as `git-ignore` in your Cargo bin direc
 
 Make sure `~/.cargo/bin/` is in your PATH to use the command from anywhere.
 
+## Uninstall
+
+To uninstall the tool, run:
+
+```bash
+cargo uninstall --bin git-ignore
+```
+
 ## Usage
 
 Navigate to your Git project directory and run:
