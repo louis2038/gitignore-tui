@@ -6,9 +6,11 @@ use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
  
 
-use crossterm::event::{poll, read, Event, KeyCode};
+use crossterm::event::{read, Event, KeyCode};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, ClearType};
 use crossterm::{cursor, execute, queue, style, terminal};
+
+const HEADER_ROWS: u16 = 2;
 
 #[derive(Debug, Clone)]
 struct Node {
@@ -143,20 +145,26 @@ fn collapse_subtree(nodes: &mut Vec<Node>, idx: usize) {
 }
 
 fn render_header(out: &mut impl Write) -> Result<()> {
+    // Draw header at lines 0 and 1 using explicit positioning
     queue!(
         out,
+        cursor::MoveTo(0, 0),
+        terminal::Clear(ClearType::CurrentLine),
         style::SetAttribute(style::Attribute::Bold),
         style::SetBackgroundColor(style::Color::DarkGrey),
+        style::SetForegroundColor(style::Color::White),
         style::Print(" [S]ave "),
         style::ResetColor,
         style::SetAttribute(style::Attribute::Reset),
         style::Print("  "),
         style::SetAttribute(style::Attribute::Bold),
         style::SetBackgroundColor(style::Color::DarkGrey),
+        style::SetForegroundColor(style::Color::White),
         style::Print(" [Q]uit "),
         style::ResetColor,
         style::SetAttribute(style::Attribute::Reset),
-        style::Print("\r\n\r\n")
+        cursor::MoveTo(0, 1),
+        terminal::Clear(ClearType::CurrentLine) // Empty separator line
     )?;
     Ok(())
 }
@@ -176,14 +184,36 @@ fn has_selected_children(nodes: &Vec<Node>, parent_idx: usize) -> bool {
     false
 }
 
-fn render(nodes: &Vec<Node>, cursor_pos: usize) -> Result<()> {
+fn render(nodes: &Vec<Node>, cursor_pos: usize, scroll_offset: usize) -> Result<()> {
     let mut out = stdout();
-    queue!(out, terminal::Clear(ClearType::All), cursor::MoveTo(0, 0))?;
     
-    // Display button bar at the top
+    // Get terminal size
+    let (_, term_height) = terminal::size()?;
+    let viewport_rows = term_height.saturating_sub(HEADER_ROWS) as usize;
+    
+    // Clear screen once and draw header
+    queue!(
+        out,
+        cursor::Hide,
+        terminal::Clear(ClearType::All),
+        style::ResetColor,
+        style::SetAttribute(style::Attribute::Reset)
+    )?;
+    
     render_header(&mut out)?;
     
-    for (i, n) in nodes.iter().enumerate() {
+    // Calculate visible range
+    let visible_start = scroll_offset.min(nodes.len());
+    let visible_end = (visible_start + viewport_rows).min(nodes.len());
+    
+    // Display the visible portion of the tree
+    for (line_idx, i) in (visible_start..visible_end).enumerate() {
+        let n = &nodes[i];
+        let y = HEADER_ROWS + line_idx as u16;
+        
+        // Position cursor and clear the line
+        queue!(out, cursor::MoveTo(0, y), terminal::Clear(ClearType::CurrentLine))?;
+        
         if i == cursor_pos {
             queue!(out, style::SetAttribute(style::Attribute::Reverse))?;
         }
@@ -234,8 +264,8 @@ fn render(nodes: &Vec<Node>, cursor_pos: usize) -> Result<()> {
         if i == cursor_pos {
             queue!(out, style::SetAttribute(style::Attribute::Reset))?;
         }
-        queue!(out, style::Print("\r\n"))?;
     }
+    
     out.flush()?;
     Ok(())
 }
@@ -280,24 +310,44 @@ fn main() -> Result<()> {
     }
 
     enable_raw_mode()?;
-    execute!(stdout(), terminal::EnterAlternateScreen)?;
+    execute!(
+        stdout(),
+        terminal::EnterAlternateScreen,
+        cursor::Hide
+    )?;
 
     let mut cursor_pos = 0usize;
-    render(&nodes, cursor_pos)?;
-
+    let mut scroll_offset = 0usize;
+    
+    // Initial render
+    render(&nodes, cursor_pos, scroll_offset)?;
+    
     loop {
-        if poll(std::time::Duration::from_millis(200))? {
-            if let Event::Key(k) = read()? {
+        // Wait for an event (blocking, no timeout)
+        match read()? {
+            Event::Key(k) => {
+                // Get terminal size for scroll calculations
+                let (_, term_height) = terminal::size()?;
+                let available_height = (term_height as usize).saturating_sub(2).max(1);
+                
                 match k.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Up => {
                         if cursor_pos > 0 {
                             cursor_pos -= 1;
+                            // Adjust scroll if cursor goes above visible area
+                            if cursor_pos < scroll_offset {
+                                scroll_offset = cursor_pos;
+                            }
                         }
                     }
                     KeyCode::Down => {
                         if cursor_pos + 1 < nodes.len() {
                             cursor_pos += 1;
+                            // Adjust scroll if cursor goes below visible area
+                            if cursor_pos >= scroll_offset + available_height {
+                                scroll_offset = cursor_pos + 1 - available_height;
+                            }
                         }
                     }
                     KeyCode::Right => {
@@ -313,6 +363,19 @@ fn main() -> Result<()> {
                         if nodes[cursor_pos].is_dir && nodes[cursor_pos].expanded {
                             collapse_subtree(&mut nodes, cursor_pos);
                             nodes[cursor_pos].expanded = false;
+                            
+                            // Adjust scroll_offset if it's now out of bounds
+                            if nodes.len() > 0 {
+                                let max_scroll = nodes.len().saturating_sub(available_height);
+                                scroll_offset = scroll_offset.min(max_scroll);
+                                
+                                // Ensure cursor is still visible
+                                if cursor_pos < scroll_offset {
+                                    scroll_offset = cursor_pos;
+                                } else if cursor_pos >= scroll_offset + available_height {
+                                    scroll_offset = cursor_pos + 1 - available_height;
+                                }
+                            }
                         } else {
                             // try to move to parent
                             if nodes[cursor_pos].depth > 0 {
@@ -322,6 +385,10 @@ fn main() -> Result<()> {
                                     p -= 1;
                                     if nodes[p].depth < depth {
                                         cursor_pos = p;
+                                        // Adjust scroll if needed
+                                        if cursor_pos < scroll_offset {
+                                            scroll_offset = cursor_pos;
+                                        }
                                         break;
                                     }
                                 }
@@ -387,14 +454,31 @@ fn main() -> Result<()> {
                             .context("Writing .gitignore")?;
                         break;
                     }
-                    _ => {}
+                    _ => continue, // Don't render for unknown keys
                 }
+                
+                // Ensure scroll_offset stays within valid bounds
+                if nodes.len() > 0 {
+                    let max_scroll = nodes.len().saturating_sub(available_height);
+                    scroll_offset = scroll_offset.min(max_scroll);
+                }
+                
+                // Render only after handling a key action
+                render(&nodes, cursor_pos, scroll_offset)?;
             }
+            Event::Resize(_, _) => {
+                // Redraw when terminal is resized
+                render(&nodes, cursor_pos, scroll_offset)?;
+            }
+            _ => {}
         }
-        render(&nodes, cursor_pos)?;
     }
 
-    execute!(stdout(), terminal::LeaveAlternateScreen)?;
+    execute!(
+        stdout(),
+        cursor::Show,
+        terminal::LeaveAlternateScreen
+    )?;
     disable_raw_mode()?;
 
     println!("Selection completed. The `.gitignore` file has been updated in '{}'.", root_path);
