@@ -1,0 +1,19 @@
+[package]
+name = "gitignore-tui"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+description = "Interactive terminal UI for managing .gitignore files"
+repository = "https://github.com/louis2038/gitignore-tui"
+authors = ["Louis Triouleyre-Roberjot <louis.triouleyre@gmail.com>"]
+
+[[bin]]
+name = "git-ignore"
+path = "src/main.rs"
+
+[dependencies]
+inquire = "0.9"
+anyhow = "1"
+crossterm = "0.29"
+walkdir = "2"
+ignore = "0.4"
