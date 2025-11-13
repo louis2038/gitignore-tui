@@ -39,7 +39,9 @@ struct Rule {
 
 /// Parsing du .gitignore :
 /// - on garde uniquement les règles SANS wildcard compliqué (* ? [)
-/// - mais on reconnaît "dir/*" comme "dir"
+///   sauf "*" ou "/*" que l'on accepte comme "tout le repo"
+/// - on reconnaît "dir/*" comme "dir"
+/// - on accepte les règles avec ou sans "/" en tête, mais on normalise sans "/"
 /// - on distingue C (ligne normale) et E (ligne commençant par !)
 /// - on retourne une liste ordonnée de règles
 fn parse_gitignore(root: &Path) -> Result<Vec<Rule>> {
@@ -62,9 +64,32 @@ fn parse_gitignore(root: &Path) -> Result<Vec<Rule>> {
         let mut pattern = trimmed;
         let mut mode = Mode::C;
 
+        // Exception ?
         if pattern.starts_with('!') {
             mode = Mode::E;
             pattern = &pattern[1..];
+        }
+
+        // On enlève un éventuel "/" au début (on normalise les chemins sans "/")
+        if pattern.starts_with('/') {
+            pattern = &pattern[1..];
+        }
+
+        // Cas spécial : "*" ou "" (si la ligne originale était "/" ou "/*")
+        let mut is_root_wildcard = false;
+        if pattern == "*" {
+            is_root_wildcard = true;
+        } else if pattern == "" {
+            // Cas bizarre mais au cas où quelqu'un mettrait juste "/"
+            is_root_wildcard = true;
+        }
+
+        if is_root_wildcard {
+            rules.push(Rule {
+                pattern: "*".to_string(), // on encode le "tout" avec "*"
+                mode,
+            });
+            continue;
         }
 
         // On traite "xxx/*" comme "xxx" (répertoire)
@@ -79,7 +104,8 @@ fn parse_gitignore(root: &Path) -> Result<Vec<Rule>> {
             continue;
         }
 
-        // On ignore les règles trop génériques
+        // On ignore les règles trop génériques avec wildcard,
+        // sauf celles déjà gérées ci-dessus.
         if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
             continue;
         }
@@ -96,6 +122,7 @@ fn parse_gitignore(root: &Path) -> Result<Vec<Rule>> {
 }
 
 /// Construit l'arbre COMPLET de tous les fichiers/répertoires (en pré-ordre).
+/// On ajoute un noeud racine "/" qui contient tout le répertoire `root`.
 /// Tous les nodes démarrent avec mode = N, mark = false
 fn build_full_tree(root: &Path) -> Result<Vec<Node>> {
     fn build_dir(
@@ -113,7 +140,8 @@ fn build_full_tree(root: &Path) -> Result<Vec<Node>> {
         for ent in read {
             if let Ok(e) = ent {
                 let p = e.path();
-                let name = p.file_name()
+                let name = p
+                    .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "".into());
                 if p.is_dir() {
@@ -149,19 +177,35 @@ fn build_full_tree(root: &Path) -> Result<Vec<Node>> {
     }
 
     let mut nodes = Vec::new();
-    build_dir(root, root, 0, &mut nodes)?;
+
+    // --- NOEUD RACINE VIRTUEL CLIQUABLE ---
+    nodes.push(Node {
+        path: root.to_path_buf(),
+        name: "/".to_string(),
+        is_dir: true,
+        depth: 0,
+        expanded: true, // on commence ouvert
+        mode: Mode::N,
+        mark: false,
+        cpt_exception: 0,
+        cpt_mixed_marks: 0,
+    });
+
+    // Les enfants du root sont en profondeur 1
+    build_dir(root, root, 1, &mut nodes)?;
     Ok(nodes)
 }
 
-/// Applique les règles du .gitignore sur l'arbre :
-/// - on applique les règles dans l'ordre (dernière règle qui matche gagne)
-/// - règle C : marque le node exact (mode=C, mark=true) et propage mark=true aux descendants
-/// - règle E : met mode=E et mark=false sur le node exact et propage mark=false aux descendants
 fn apply_rules_to_nodes(nodes: &mut Vec<Node>, root: &Path, rules: &[Rule]) {
     let len = nodes.len();
 
     for i in 0..len {
-        let rel = nodes[i].path.strip_prefix(root).unwrap_or(&nodes[i].path);
+        let rel = if nodes[i].path == root {
+            // noeud racine virtuel -> chemin relatif vide
+            Path::new("")
+        } else {
+            nodes[i].path.strip_prefix(root).unwrap_or(&nodes[i].path)
+        };
         let rel_str = rel.to_string_lossy().replace("\\", "/");
 
         // reset de base
@@ -171,21 +215,38 @@ fn apply_rules_to_nodes(nodes: &mut Vec<Node>, root: &Path, rules: &[Rule]) {
         for rule in rules {
             let pat = &rule.pattern;
 
+            // Cas spécial : "*" = toute l'arborescence
+            if pat == "*" {
+                match rule.mode {
+                    Mode::C => {
+                        nodes[i].mark = true;
+                        if nodes[i].mode == Mode::E {
+                            nodes[i].mode = Mode::N;
+                        }
+                    }
+                    Mode::E => {
+                        nodes[i].mark = false;
+                        if nodes[i].mode == Mode::C {
+                            nodes[i].mode = Mode::N;
+                        }
+                    }
+                    Mode::N => {}
+                }
+                continue;
+            }
+
             let is_exact = rel_str == *pat;
-            let is_descendant = rel_str.starts_with(pat) 
-                && rel_str.len() > pat.len() 
+            let is_descendant = rel_str.starts_with(pat)
+                && rel_str.len() > pat.len()
                 && rel_str.as_bytes()[pat.len()] == b'/';
 
             match rule.mode {
                 Mode::C => {
                     if is_exact {
-                        // répertoire "racine" de la règle target/*
                         nodes[i].mode = Mode::C;
                         nodes[i].mark = true;
                     } else if is_descendant {
-                        // tout le sous-arbre est marqué ignoré par cette règle
                         nodes[i].mark = true;
-                        // si un E précédent existait pour ce node, il est écrasé
                         if nodes[i].mode == Mode::E {
                             nodes[i].mode = Mode::N;
                         }
@@ -193,13 +254,10 @@ fn apply_rules_to_nodes(nodes: &mut Vec<Node>, root: &Path, rules: &[Rule]) {
                 }
                 Mode::E => {
                     if is_exact {
-                        // exception explicite sur ce node
                         nodes[i].mode = Mode::E;
                         nodes[i].mark = false;
                     } else if is_descendant {
-                        // descendants d'une exception : ils sont aussi des exceptions
                         nodes[i].mark = false;
-                        // on écrase un éventuel mode précédent
                         if nodes[i].mode == Mode::C {
                             nodes[i].mode = Mode::N;
                         }
@@ -212,7 +270,6 @@ fn apply_rules_to_nodes(nodes: &mut Vec<Node>, root: &Path, rules: &[Rule]) {
 
     // cpt_exception pour tout l'arbre
     recompute_cpt_exception(nodes);
-    
     // cpt_mixed_marks pour tout l'arbre
     recompute_cpt_mixed_marks(nodes);
 }
@@ -433,10 +490,24 @@ fn should_be_ignored(file_path: &str, rules: &[Rule]) -> bool {
 
     for rule in rules {
         let pat = &rule.pattern;
-        
+
+        // "*" = tout
+        if pat == "*" {
+            match rule.mode {
+                Mode::C => {
+                    should_ignore = true;
+                }
+                Mode::E => {
+                    should_ignore = false;
+                }
+                Mode::N => {}
+            }
+            continue;
+        }
+
         let is_exact = normalized == *pat;
-        let is_descendant = normalized.starts_with(pat) 
-            && normalized.len() > pat.len() 
+        let is_descendant = normalized.starts_with(pat)
+            && normalized.len() > pat.len()
             && normalized.as_bytes()[pat.len()] == b'/';
 
         match rule.mode {
@@ -693,21 +764,36 @@ fn main() -> Result<()> {
                         use std::collections::HashSet;
                         let mut to_remove: HashSet<String> = HashSet::new();
 
-                        // On prépare les variantes à supprimer
+                        // On prépare les variantes à supprimer (avec et sans "/")
                         for n in &nodes {
                             let rel = n.path.strip_prefix(root).unwrap_or(&n.path);
                             let mut entry = rel.to_string_lossy().to_string();
-                            if entry.is_empty() {
-                                continue;
-                            }
                             entry = entry.replace("\\", "/");
 
+                            if entry.is_empty() {
+                                continue; // le noeud racine "/" est géré à part
+                            }
+
                             let base = entry.clone();
+
+                            // Anciennes formes sans "/" devant
                             to_remove.insert(base.clone());
                             to_remove.insert(format!("{base}/*"));
                             to_remove.insert(format!("!{base}"));
                             to_remove.insert(format!("!{base}/*"));
+
+                            // Nouvelles formes avec "/" devant
+                            to_remove.insert(format!("/{base}"));
+                            to_remove.insert(format!("/{base}/*"));
+                            to_remove.insert(format!("!/{base}"));
+                            to_remove.insert(format!("!/{base}/*"));
                         }
+
+                        // On gère aussi les patterns globaux "*", "/*", "!*", "/*!*"
+                        to_remove.insert("*".to_string());
+                        to_remove.insert("/*".to_string());
+                        to_remove.insert("!*".to_string());
+                        to_remove.insert("!/*".to_string());
 
                         // On garde les lignes qui ne nous concernent pas
                         lines.retain(|line| {
@@ -722,40 +808,58 @@ fn main() -> Result<()> {
                         for n in &nodes {
                             let rel = n.path.strip_prefix(root).unwrap_or(&n.path);
                             let mut entry = rel.to_string_lossy().to_string();
-                            if entry.is_empty() {
-                                continue;
-                            }
                             entry = entry.replace("\\", "/");
 
+                            // --- CAS PARTICULIER : NOEUD RACINE "/" ---
+                            if entry.is_empty() {
+                                // Racine virtuelle
+                                match n.mode {
+                                    Mode::C => {
+                                        // "ignore tout" -> /* dans le .gitignore
+                                        lines.push("/*".to_string());
+                                    }
+                                    Mode::E => {
+                                        // Cas peu probable : "exception" sur la racine.
+                                        // On pourrait écrire "!/*" mais c'est bizarre.
+                                        // On ne met rien ici pour ne pas produire de règle étrange.
+                                    }
+                                    Mode::N => {
+                                        // Rien à écrire pour la racine si mode N
+                                    }
+                                }
+                                continue;
+                            }
+
+                            // Pour les autres entrées : on écrit toujours un "/" devant
                             match n.mode {
                                 Mode::N => {
-                                    // RÉPERTOIRE "normal" mais qui contient au moins une exception
+                                    // Répertoire "normal" mais qui contient au moins une exception
                                     // -> on veut :
-                                    // !entry
-                                    // entry/*
+                                    // !/entry
+                                    // /entry/*
                                     //
                                     // Exemple : target/test
                                     // résultat :
-                                    // !target/test
-                                    // target/test/*
+                                    // !/target/test
+                                    // /target/test/*
                                     if n.is_dir && n.cpt_exception > 0 {
-                                        lines.push(format!("!{}", entry));
-                                        lines.push(format!("{entry}/*"));
+                                        lines.push(format!("!/{entry}"));
+                                        lines.push(format!("/{entry}/*"));
                                     }
                                 }
                                 Mode::C => {
                                     // Règle d'ignore classique
-                                    // - si c'est un dossier avec des exceptions -> entry/*
-                                    // - sinon -> entry
+                                    // - si c'est un dossier avec des exceptions -> /entry/*
+                                    // - sinon -> /entry
                                     if n.is_dir && n.cpt_exception > 0 {
-                                        lines.push(format!("{entry}/*"));
+                                        lines.push(format!("/{entry}/*"));
                                     } else {
-                                        lines.push(entry);
+                                        lines.push(format!("/{entry}"));
                                     }
                                 }
                                 Mode::E => {
                                     // Exception explicite
-                                    lines.push(format!("!{}", entry));
+                                    lines.push(format!("!/{entry}"));
                                 }
                             }
                         }

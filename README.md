@@ -1,14 +1,18 @@
 # gitignore-tui
 
-Simple interactive terminal for visually selecting and managing .gitignore entries in your Git projects.
+Interactive terminal UI for visually managing .gitignore entries in your Git or Jujutsu projects with support for complex ignore patterns and exceptions.
 
 ## Features
 
 - 🎨 **Interactive Terminal UI** - Navigate through your project files with an intuitive interface
 - 📁 **Tree View** - Expand and collapse directories to explore your project structure
 - ✅ **Visual Selection** - Check/uncheck files and directories to add/remove from .gitignore
-- 🔒 **Generic Rule Detection** - Automatically detects and locks items matched by wildcard patterns
+- 🎯 **Smart Rule Management** - Supports both standard ignore rules and exception patterns
+- 🔄 **Reverse Gitignore** - Create "ignore everything except" patterns with `/*` + exceptions
+- 🌳 **Root Directory Control** - Clickable `/` root node to ignore or whitelist the entire project
+- 🎨 **Visual Indicators** - Color-coded directories show mixed selection states
 - 💾 **Smart Editing** - Preserves existing .gitignore entries and comments
+- 🦀 **Jujutsu Integration** - Optional `-j` flag to automatically untrack ignored files in Jujutsu repos
 - ⚡ **Fast Navigation** - Keyboard shortcuts for efficient workflow
 
 ## Installation
@@ -38,12 +42,12 @@ Make sure `~/.cargo/bin/` is in your PATH to use the command from anywhere.
 To uninstall the tool, run:
 
 ```bash
-cargo uninstall --bin git-ignore
+cargo uninstall git-ignore
 ```
 
 ## Usage
 
-Navigate to your Git project directory and run:
+Navigate to your project directory and run:
 
 ```bash
 git-ignore
@@ -55,40 +59,188 @@ Or specify a directory path:
 git-ignore /path/to/your/project
 ```
 
+### Jujutsu Integration
+
+If you're using [Jujutsu](https://github.com/martinvonz/jj) as your version control system, you can use the `-j` or `--jj` flag to automatically untrack files that should be ignored:
+
+```bash
+git-ignore -j
+```
+
+This will:
+1. Save your .gitignore changes
+2. Run `jj file list` to get all tracked files
+3. Automatically untrack any files that match the ignore rules
+
+This is useful when you add new ignore rules and want to immediately remove those files from tracking.
+
 ### Keyboard Shortcuts
 
 - **↑/↓** - Navigate up and down
-- **←/→** - Collapse/expand directories or move to parent
-- **Enter** - Toggle selection for the current item
-- **S** - Save changes to .gitignore
+- **←/→** - Collapse/expand directories or move to parent directory
+- **Enter** - Toggle selection (ignore/unignore) for the current item
+- **S** - Save changes to .gitignore and exit
 - **Q** - Quit without saving
 
-### Interface Symbols
+### Visual Indicators
 
-- `[ ]` - Not ignored
-- `[x]` - Explicitly ignored (can be toggled)
-- `[X]` - Ignored by a generic rule (locked, cannot be toggled)
-- `[/]` - Directory with some children ignored
-- `▸` - Collapsed directory
-- `▾` - Expanded directory
+#### Selection States
+- `[ ]` - Not ignored (file/directory will be tracked)
+- `[x]` - Ignored (file/directory will be ignored by Git/Jujutsu)
+
+#### Directory Colors
+- **Blue directory** - All children have the same selection state (consistent)
+- **Yellow directory** - Contains mixed selections (some children ignored, some not)
+
+#### Directory Expansion
+- `▸` - Collapsed directory (children hidden)
+- `▾` - Expanded directory (children visible)
+
+#### Root Directory
+- `/` - Special root node representing the entire project directory
+  - Can be checked to create a "reverse gitignore" (ignore everything by default)
+  - Useful for projects where you want to whitelist specific files
 
 ## How It Works
 
-1. The tool scans your project directory
-2. It reads your existing `.gitignore` file (if present)
-3. Files/directories matched by exact entries are shown as selected
-4. Files/directories matched by generic patterns (wildcards) are locked
-5. You can toggle selection for non-locked items
-6. When you save (press **S**), the `.gitignore` file is updated with your changes
+### Rule Types
 
-## Example
+The tool manages three types of patterns in your .gitignore:
 
+1. **Classic Rules (C)** - Standard ignore patterns
+   - Example: `/build` ignores the build directory
+   
+2. **Exception Rules (E)** - Whitelist patterns starting with `!`
+   - Example: `!/build/important.txt` makes an exception for a specific file
+   
+3. **Normal (N)** - Files/directories without explicit rules
+
+### Rule Application
+
+Rules are processed in order from top to bottom of the .gitignore file, with later rules overriding earlier ones:
+
+1. The tool reads your existing `.gitignore` file
+2. Accepts rules with or without leading `/` (e.g., `src` or `/src`)
+3. Supports the special pattern `/*` to ignore everything at the root
+4. Applies rules to the file tree, with the last matching rule winning
+5. Propagates ignore state recursively to child files/directories
+
+### Smart Pattern Generation
+
+When you save, the tool generates optimized .gitignore patterns:
+
+- **Simple file/directory**: `/path/to/file`
+- **Directory with exceptions**: 
+  ```
+  !/parent/dir
+  /parent/dir/*
+  ```
+  This pattern allows the directory but ignores all its contents (useful for nested exceptions)
+- **Root wildcard**: `/*` (when the root `/` node is marked as ignored)
+- **Exception**: `!/path/to/exception`
+
+All generated patterns use leading `/` for consistency and precision (anchored to repository root).
+
+### Recursive Selection
+
+When you toggle a directory:
+- Checking a directory marks all its children as ignored
+- Unchecking creates an exception for that directory and its children
+- The tool automatically generates the necessary patterns to maintain your selections
+
+### Example Workflow
+
+#### Scenario 1: Standard Ignore
+```
+[ ] /
+  [ ] src/
+    [ ] main.rs
+  [x] target/     <- Mark as ignored
+  [ ] README.md
+```
+
+Result in .gitignore:
+```
+/target
+```
+
+#### Scenario 2: Reverse Gitignore
+```
+[x] /            <- Mark root as ignored
+  [x] src/
+    [ ] main.rs   <- Unmark this file
+  [x] target/
+  [ ] README.md   <- Unmark this file
+```
+
+Result in .gitignore:
+```
+/*
+!/src
+/src/*
+!/src/main.rs
+!/README.md
+```
+
+This creates an "ignore everything except" pattern.
+
+#### Scenario 3: Directory with Exceptions
+```
+[x] build/       <- Directory ignored
+  [x] output/
+  [ ] config.yml <- Exception
+```
+
+Result in .gitignore:
+```
+/build/*
+!/build/config.yml
+```
+
+## Technical Details
+
+### Pattern Normalization
+
+- Input patterns: Accepts both `/src` and `src`
+- Output patterns: Always generates `/src` (anchored to root)
+- Path separators: Automatically converts Windows `\` to `/`
+
+### File Exclusions
+
+The tool automatically handles:
+- Comments (lines starting with `#`)
+- Empty lines
+- Complex wildcard patterns (`*`, `?`, `[...]`) - these are preserved but not displayed in the UI
+
+### Counter Display
+
+Directories show useful counters:
+- **Exception count**: Number of exception rules (`!pattern`) in the subtree
+- **Mixed marks**: Visual indicator (yellow) when children have different selection states
+
+## Examples
+
+### Basic Usage
 ```bash
 cd my-project
 git-ignore
 ```
 
-Navigate through your files, select what you want to ignore, press **S** to save, and **Q** to quit.
+### With Jujutsu Auto-Untrack
+```bash
+git-ignore --jj
+```
+
+### Specify Different Directory
+```bash
+git-ignore ~/projects/my-app
+```
+
+## Requirements
+
+- Rust 1.70 or higher
+- Terminal with Unicode support for tree characters (▸, ▾, │)
+- For Jujutsu integration: `jj` command must be in PATH
 
 ## License
 
@@ -97,3 +249,7 @@ Proprietary
 ## Author
 
 Louis Triouleyre-Roberjot <louis.triouleyre@gmail.com>
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit issues or pull requests.

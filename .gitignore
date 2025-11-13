@@ -1,8 +1,2 @@
-/*
-!/src
-!/.gitignore
-!/Cargo.lock
-!/Cargo.toml
-!/LICENSE
-!/README.md
-target
+*.png
+/target
