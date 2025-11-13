@@ -8,6 +8,7 @@ use std::process::Command;
 use crossterm::event::{read, Event, KeyCode};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, ClearType};
 use crossterm::{cursor, execute, queue, style, terminal};
+use ignore::gitignore::GitignoreBuilder; // NEW
 
 const HEADER_ROWS: u16 = 2;
 
@@ -26,9 +27,10 @@ struct Node {
     depth: usize,
     expanded: bool,
     mode: Mode,
-    mark: bool,          // [x] ou [ ]
-    cpt_exception: usize, // 0 ou 1 pour un fichier, somme récursive pour un dossier
-    cpt_mixed_marks: usize, // nombre de descendants avec mark différent du parent
+    mark: bool,
+    cpt_exception: usize,
+    cpt_mixed_marks: usize,
+    generic_mark: bool, // NEW : fichier marqué par une règle générique (*.png, etc.)
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +169,7 @@ fn build_full_tree(root: &Path) -> Result<Vec<Node>> {
                 mark: false,
                 cpt_exception: 0,
                 cpt_mixed_marks: 0,
+                generic_mark: false, // NEW
             };
             nodes.push(node);
             if is_dir {
@@ -189,6 +192,7 @@ fn build_full_tree(root: &Path) -> Result<Vec<Node>> {
         mark: false,
         cpt_exception: 0,
         cpt_mixed_marks: 0,
+        generic_mark: false, // NEW
     });
 
     // Les enfants du root sont en profondeur 1
@@ -352,8 +356,11 @@ fn apply_recursive_mark_on_dir(nodes: &mut Vec<Node>, idx: usize, mark: bool) {
 
     let mut i = idx + 1;
     while i < nodes.len() && nodes[i].depth > depth {
-        nodes[i].mark = mark;
-        nodes[i].mode = Mode::N;
+        if !nodes[i].generic_mark {
+            // NEW : on ne touche pas aux fichiers génériques
+            nodes[i].mark = mark;
+            nodes[i].mode = Mode::N;
+        }
         nodes[i].cpt_exception = 0;
         i += 1;
     }
@@ -436,11 +443,16 @@ fn render(nodes: &Vec<Node>, visible: &Vec<usize>, cursor_pos: usize, scroll_off
             queue!(out, style::Print("│ "))?;
         }
 
-        if n.mark {
-            queue!(out, style::Print("[x] "))?;
+        // NEW : affichage du symbole de mark
+        let mark_symbol = if n.generic_mark {
+            "[o]" // NEW : fichier marqué par règle générique
+        } else if n.mark {
+            "[x]"
         } else {
-            queue!(out, style::Print("[ ] "))?;
-        }
+            "[ ]"
+        };
+
+        queue!(out, style::Print(format!("{} ", mark_symbol)))?;
 
         if n.is_dir {
             let marker = if n.expanded { "▾" } else { "▸" };
@@ -456,9 +468,16 @@ fn render(nodes: &Vec<Node>, visible: &Vec<usize>, cursor_pos: usize, scroll_off
                     style::SetAttribute(style::Attribute::Reset)
                 )?;
             } else {
+                // Inversé : bleu foncé pour marqué, bleu clair pour non marqué
+                let dir_color = if n.mark {
+                    style::Color::DarkBlue    // marqué : bleu foncé
+                } else {
+                    style::Color::Blue        // non marqué : bleu clair
+                };
+
                 queue!(
                     out,
-                    style::SetForegroundColor(style::Color::Blue),
+                    style::SetForegroundColor(dir_color),
                     style::SetAttribute(style::Attribute::Bold),
                     style::Print(format!("{} {}", marker, n.name)),
                     style::ResetColor,
@@ -466,9 +485,16 @@ fn render(nodes: &Vec<Node>, visible: &Vec<usize>, cursor_pos: usize, scroll_off
                 )?;
             }
         } else {
+            // NEW : fichier marqué -> gris
+            let file_color = if n.mark {
+                style::Color::DarkGrey
+            } else {
+                style::Color::White
+            };
+
             queue!(
                 out,
-                style::SetForegroundColor(style::Color::White),
+                style::SetForegroundColor(file_color),
                 style::Print(format!("  {}", n.name)),
                 style::ResetColor
             )?;
@@ -544,8 +570,11 @@ fn untrack_ignored_files(root: &Path) -> Result<()> {
 
     let tracked_files = String::from_utf8_lossy(&output.stdout);
     
-    // Parse les règles du .gitignore actuel
+    // Parse les règles du .gitignore actuel (règles simples)
     let rules = parse_gitignore(root)?;
+
+    // NEW : matcher pour les règles génériques (*.png, etc.)
+    let generic_gitignore = build_generic_gitignore(root)?;
     
     let mut untracked_count = 0;
     
@@ -555,8 +584,20 @@ fn untrack_ignored_files(root: &Path) -> Result<()> {
             continue;
         }
         
-        // Vérifie si le fichier devrait être ignoré
-        if should_be_ignored(file, &rules) {
+        // Vérifie si le fichier devrait être ignoré par les règles simples
+        let mut ignored = should_be_ignored(file, &rules);
+
+        // NEW : vérifie aussi contre les patterns génériques
+        if !ignored {
+            if let Some(ref gi) = generic_gitignore {
+                let path = Path::new(file);
+                if gi.matched(path, false).is_ignore() {
+                    ignored = true;
+                }
+            }
+        }
+        
+        if ignored {
             println!("Untracking: {}", file);
             
             let untrack_output = Command::new("jj")
@@ -583,6 +624,89 @@ fn untrack_ignored_files(root: &Path) -> Result<()> {
         println!("\nNo files to untrack.");
     }
     
+    Ok(())
+}
+
+/// NEW : Construit un matcher pour les règles génériques (*.png, etc.)
+fn build_generic_gitignore(root: &Path) -> Result<Option<ignore::gitignore::Gitignore>> {
+    let gitignore_path = root.join(".gitignore");
+    if !gitignore_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&gitignore_path)
+        .context("Reading .gitignore for generic patterns")?;
+
+    let mut builder = GitignoreBuilder::new(root);
+    let mut has_patterns = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // On ignore les exceptions génériques pour l'instant
+        if trimmed.starts_with('!') {
+            continue;
+        }
+
+        // On ne veut pas "*" ou "/*"
+        if trimmed == "*" || trimmed == "/*" {
+            continue;
+        }
+
+        // On ne veut pas les "qqchose/*"
+        if trimmed.ends_with("/*") {
+            continue;
+        }
+
+        // On ne garde que les patterns avec wildcard
+        if trimmed.contains('*') || trimmed.contains('?') || trimmed.contains('[') {
+            builder
+                .add_line(None, trimmed)
+                .context("Adding generic pattern to GitignoreBuilder")?;
+            has_patterns = true;
+        }
+    }
+
+    if !has_patterns {
+        return Ok(None);
+    }
+
+    let gitignore = builder
+        .build()
+        .context("Building generic Gitignore matcher")?;
+
+    Ok(Some(gitignore))
+}
+
+/// NEW : Marque les fichiers qui correspondent aux patterns génériques
+fn mark_generic_matches(nodes: &mut Vec<Node>, root: &Path) -> Result<()> {
+    let gitignore_opt = build_generic_gitignore(root)?;
+    let Some(gitignore) = gitignore_opt else {
+        return Ok(());
+    };
+
+    for n in nodes.iter_mut() {
+        if n.path == root {
+            continue;
+        }
+        if !n.path.is_file() {
+            continue;
+        }
+
+        let rel = n.path.strip_prefix(root).unwrap_or(&n.path);
+        let matched = gitignore.matched(rel, false);
+
+        if matched.is_ignore() {
+            n.mark = true;
+            n.generic_mark = true;
+        }
+    }
+
+    // Les marks ayant changé, on recalcule les mixed-marks
+    recompute_cpt_mixed_marks(nodes);
     Ok(())
 }
 
@@ -625,6 +749,9 @@ fn main() -> Result<()> {
 
     // 3) On applique les règles : propagation des marks + exceptions
     apply_rules_to_nodes(&mut nodes, root, &rules);
+
+    // NEW : on applique les patterns génériques (*.png, etc.)
+    mark_generic_matches(&mut nodes, root)?;
 
     // 4) On recalcule les cpt_exception et cpt_mixed_marks
     recompute_cpt_exception(&mut nodes);
@@ -707,6 +834,12 @@ fn main() -> Result<()> {
                         }
 
                         let idx = visible[cursor_pos];
+                        
+                        // NEW : les fichiers marqués par une règle générique (*.png, etc.) ne sont pas cliquables
+                        if nodes[idx].generic_mark && !nodes[idx].is_dir {
+                            continue;
+                        }
+                        
                         let was_marked = nodes[idx].mark;
                         let is_dir = nodes[idx].is_dir;
 
@@ -804,29 +937,24 @@ fn main() -> Result<()> {
                             !to_remove.contains(trimmed)
                         });
 
+                        // --- CAS PARTICULIER : NOEUD RACINE "/" ---
+                        // On commence par gérer le noeud racine s'il est marqué
+                        if !nodes.is_empty() {
+                            let root_node = &nodes[0];
+                            if root_node.mark {
+                                // Le noeud racine est marqué -> on veut "/*" en premier
+                                lines.insert(0, "/*".to_string());
+                            }
+                        }
+
                         // On ajoute les nouvelles règles selon mode / cpt_exception
                         for n in &nodes {
                             let rel = n.path.strip_prefix(root).unwrap_or(&n.path);
                             let mut entry = rel.to_string_lossy().to_string();
                             entry = entry.replace("\\", "/");
 
-                            // --- CAS PARTICULIER : NOEUD RACINE "/" ---
+                            // Sauter le noeud racine, déjà traité ci-dessus
                             if entry.is_empty() {
-                                // Racine virtuelle
-                                match n.mode {
-                                    Mode::C => {
-                                        // "ignore tout" -> /* dans le .gitignore
-                                        lines.push("/*".to_string());
-                                    }
-                                    Mode::E => {
-                                        // Cas peu probable : "exception" sur la racine.
-                                        // On pourrait écrire "!/*" mais c'est bizarre.
-                                        // On ne met rien ici pour ne pas produire de règle étrange.
-                                    }
-                                    Mode::N => {
-                                        // Rien à écrire pour la racine si mode N
-                                    }
-                                }
                                 continue;
                             }
 
@@ -837,11 +965,6 @@ fn main() -> Result<()> {
                                     // -> on veut :
                                     // !/entry
                                     // /entry/*
-                                    //
-                                    // Exemple : target/test
-                                    // résultat :
-                                    // !/target/test
-                                    // /target/test/*
                                     if n.is_dir && n.cpt_exception > 0 {
                                         lines.push(format!("!/{entry}"));
                                         lines.push(format!("/{entry}/*"));

@@ -2,16 +2,25 @@
 
 Interactive terminal UI for visually managing .gitignore entries in your Git or Jujutsu projects with support for complex ignore patterns and exceptions.
 
+## Development Note
+
+This project was developed through a collaboration between human logic and AI implementation:
+- The core logic (mode system, mark propagation, rule application) was designed and specified by the author
+- The user interface, terminal rendering, and integration code were implemented with AI assistance
+
+This project was developed as an initial version in a single day. Please don't hesitate to send bug reports.
+
 ## Features
 
 - 🎨 **Interactive Terminal UI** - Navigate through your project files with an intuitive interface
 - 📁 **Tree View** - Expand and collapse directories to explore your project structure
 - ✅ **Visual Selection** - Check/uncheck files and directories to add/remove from .gitignore
 - 🎯 **Smart Rule Management** - Supports both standard ignore rules and exception patterns
+- 🌟 **Generic Pattern Support** - Handles wildcard patterns like `*.png`, `*.log`, etc. with visual feedback
 - 🔄 **Reverse Gitignore** - Create "ignore everything except" patterns with `/*` + exceptions
 - 🌳 **Root Directory Control** - Clickable `/` root node to ignore or whitelist the entire project
-- 🎨 **Visual Indicators** - Color-coded directories show mixed selection states
-- 💾 **Smart Editing** - Preserves existing .gitignore entries and comments
+- 🎨 **Visual Indicators** - Color-coded directories and files show selection states
+- 💾 **Smart Editing** - Preserves existing .gitignore entries and comments (including generic patterns)
 - 🦀 **Jujutsu Integration** - Optional `-j` flag to automatically untrack ignored files in Jujutsu repos
 - ⚡ **Fast Navigation** - Keyboard shortcuts for efficient workflow
 
@@ -70,7 +79,7 @@ git-ignore -j
 This will:
 1. Save your .gitignore changes
 2. Run `jj file list` to get all tracked files
-3. Automatically untrack any files that match the ignore rules
+3. Automatically untrack any files that match the ignore rules (including generic patterns)
 
 This is useful when you add new ignore rules and want to immediately remove those files from tracking.
 
@@ -87,10 +96,18 @@ This is useful when you add new ignore rules and want to immediately remove thos
 #### Selection States
 - `[ ]` - Not ignored (file/directory will be tracked)
 - `[x]` - Ignored (file/directory will be ignored by Git/Jujutsu)
+- `[o]` - Matched by generic pattern (e.g., `*.png`, `*.log`) - **non-interactive**
+
+**Note:** Files marked with `[o]` are matched by wildcard patterns in your .gitignore and cannot be toggled in the UI. These patterns are preserved when saving but managed separately from the interactive tree.
+
+#### File Colors
+- **White** - Not ignored, will be tracked
+- **Dark Grey** - Ignored (either by direct selection `[x]` or generic pattern `[o]`)
 
 #### Directory Colors
-- **Blue directory** - All children have the same selection state (consistent)
-- **Yellow directory** - Contains mixed selections (some children ignored, some not)
+- **Light Blue** - Not ignored, all children have consistent selection state
+- **Dark Blue** - Ignored, all children have consistent selection state  
+- **Yellow** - Mixed selection state (some children ignored, some not)
 
 #### Directory Expansion
 - `▸` - Collapsed directory (children hidden)
@@ -113,7 +130,11 @@ The tool manages three types of patterns in your .gitignore:
 2. **Exception Rules (E)** - Whitelist patterns starting with `!`
    - Example: `!/build/important.txt` makes an exception for a specific file
    
-3. **Normal (N)** - Files/directories without explicit rules
+3. **Generic Patterns** - Wildcard patterns (preserved but read-only in UI)
+   - Example: `*.log`, `*.png`, `**/*.tmp`
+   - Displayed as `[o]` in the interface
+   - Cannot be toggled interactively
+   - Preserved when saving .gitignore
 
 ### Rule Application
 
@@ -122,12 +143,13 @@ Rules are processed in order from top to bottom of the .gitignore file, with lat
 1. The tool reads your existing `.gitignore` file
 2. Accepts rules with or without leading `/` (e.g., `src` or `/src`)
 3. Supports the special pattern `/*` to ignore everything at the root
-4. Applies rules to the file tree, with the last matching rule winning
-5. Propagates ignore state recursively to child files/directories
+4. Generic patterns (`*.png`, etc.) are parsed separately using the `ignore` crate
+5. Applies rules to the file tree, with the last matching rule winning
+6. Propagates ignore state recursively to child files/directories
 
 ### Smart Pattern Generation
 
-When you save, the tool generates optimized .gitignore patterns:
+When you save, the tool generates optimized .gitignore patterns while preserving existing generic patterns:
 
 - **Simple file/directory**: `/path/to/file`
 - **Directory with exceptions**: 
@@ -138,14 +160,16 @@ When you save, the tool generates optimized .gitignore patterns:
   This pattern allows the directory but ignores all its contents (useful for nested exceptions)
 - **Root wildcard**: `/*` (when the root `/` node is marked as ignored)
 - **Exception**: `!/path/to/exception`
+- **Generic patterns**: Preserved unchanged (e.g., `*.png`, `*.log`)
 
-All generated patterns use leading `/` for consistency and precision (anchored to repository root).
+All generated non-generic patterns use leading `/` for consistency and precision (anchored to repository root).
 
 ### Recursive Selection
 
 When you toggle a directory:
-- Checking a directory marks all its children as ignored
+- Checking a directory marks all its children as ignored (except files already matched by generic patterns)
 - Unchecking creates an exception for that directory and its children
+- Files marked by generic patterns `[o]` are not affected by recursive operations
 - The tool automatically generates the necessary patterns to maintain your selections
 
 ### Example Workflow
@@ -197,6 +221,25 @@ Result in .gitignore:
 !/build/config.yml
 ```
 
+#### Scenario 4: Generic Patterns (Read-Only)
+```
+[ ] /
+  [ ] images/
+    [o] photo1.png    <- Matched by *.png (non-interactive)
+    [o] photo2.png    <- Matched by *.png (non-interactive)
+    [ ] README.md
+  [ ] logs/
+    [o] app.log       <- Matched by *.log (non-interactive)
+```
+
+Existing .gitignore:
+```
+*.png
+*.log
+```
+
+These patterns are preserved when saving. Clicking on `photo1.png` or `app.log` has no effect.
+
 ## Technical Details
 
 ### Pattern Normalization
@@ -204,13 +247,22 @@ Result in .gitignore:
 - Input patterns: Accepts both `/src` and `src`
 - Output patterns: Always generates `/src` (anchored to root)
 - Path separators: Automatically converts Windows `\` to `/`
+- Generic patterns: Preserved as-is
 
 ### File Exclusions
 
 The tool automatically handles:
 - Comments (lines starting with `#`)
 - Empty lines
-- Complex wildcard patterns (`*`, `?`, `[...]`) - these are preserved but not displayed in the UI
+- Complex wildcard patterns (`*`, `?`, `[...]`) - preserved but displayed as `[o]` for matching files
+
+### Generic Pattern Handling
+
+The tool uses the `ignore` crate to properly evaluate wildcard patterns:
+- Patterns like `*.png`, `**/*.tmp`, `?.log` are evaluated against actual files
+- Only files (not directories) can be marked by generic patterns
+- Generic pattern matches are shown as `[o]` and are read-only
+- These patterns are never removed when saving
 
 ### Counter Display
 
