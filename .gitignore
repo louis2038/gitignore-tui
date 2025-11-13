@@ -1,1 +1,8 @@
-/target
+/*
+!/src
+!/.gitignore
+!/Cargo.lock
+!/Cargo.toml
+!/LICENSE
+!/README.md
+target

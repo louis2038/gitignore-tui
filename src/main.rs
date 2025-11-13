@@ -1,16 +1,22 @@
 use anyhow::{bail, Context, Result};
-use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::env;
 use std::fs;
 use std::io::{stdout, Write};
 use std::path::{Path, PathBuf};
- 
+use std::process::Command;
 
 use crossterm::event::{read, Event, KeyCode};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, ClearType};
 use crossterm::{cursor, execute, queue, style, terminal};
 
 const HEADER_ROWS: u16 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    C, // Règle classique dans .gitignore
+    E, // Exception (!...)
+    N, // Normal (aucune règle)
+}
 
 #[derive(Debug, Clone)]
 struct Node {
@@ -19,133 +25,303 @@ struct Node {
     is_dir: bool,
     depth: usize,
     expanded: bool,
-    selected: bool,
-    locked: bool,  // true if ignored by a generic rule
+    mode: Mode,
+    mark: bool,          // [x] ou [ ]
+    cpt_exception: usize, // 0 ou 1 pour un fichier, somme récursive pour un dossier
+    cpt_mixed_marks: usize, // nombre de descendants avec mark différent du parent
 }
 
-fn list_dir_entries(path: &Path, root: &Path, gi: Option<&Gitignore>) -> Result<Vec<Node>> {
-    let mut entries = Vec::new();
-    let read = fs::read_dir(path).context(format!("Reading directory {:?}", path))?;
-    let mut dirs = Vec::new();
-    let mut files = Vec::new();
-    for ent in read {
-        if let Ok(e) = ent {
-            let p = e.path();
-            let name = p
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "".into());
-            if p.is_dir() {
-                dirs.push((p, name));
-            } else {
-                files.push((p, name));
-            }
-        }
+#[derive(Debug, Clone)]
+struct Rule {
+    pattern: String, // chemin relatif normalisé "target/flycheck0"
+    mode: Mode,      // C ou E
+}
+
+/// Parsing du .gitignore :
+/// - on garde uniquement les règles SANS wildcard compliqué (* ? [)
+/// - mais on reconnaît "dir/*" comme "dir"
+/// - on distingue C (ligne normale) et E (ligne commençant par !)
+/// - on retourne une liste ordonnée de règles
+fn parse_gitignore(root: &Path) -> Result<Vec<Rule>> {
+    let gitignore_path = root.join(".gitignore");
+    if !gitignore_path.exists() {
+        return Ok(Vec::new());
     }
-    dirs.sort_by_key(|(_, n)| n.clone());
-    files.sort_by_key(|(_, n)| n.clone());
-    for (p, n) in dirs.into_iter().chain(files.into_iter()) {
-        let mut selected = false;
-        let mut locked = false;
-        let is_dir_flag = p.is_dir();
-        if let Some(g) = gi {
-            let rel = p.strip_prefix(root).unwrap_or(&p);
-            let m = g.matched(rel, is_dir_flag);
-            if m.is_ignore() {
-                selected = true;
-                // Check if it's an exact or generic rule
-                // If the exact path is not in the gitignore, it's a generic rule
-                locked = !is_exact_match(root, rel);
-            }
+
+    let content = fs::read_to_string(&gitignore_path)
+        .context("Reading existing .gitignore")?;
+
+    let mut rules = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
         }
-        entries.push(Node {
-            path: p,
-            name: n,
-            is_dir: is_dir_flag,
-            depth: 0,
-            expanded: false,
-            selected,
-            locked,
+
+        let mut pattern = trimmed;
+        let mut mode = Mode::C;
+
+        if pattern.starts_with('!') {
+            mode = Mode::E;
+            pattern = &pattern[1..];
+        }
+
+        // On traite "xxx/*" comme "xxx" (répertoire)
+        if let Some(stripped) = pattern.strip_suffix("/*") {
+            pattern = stripped;
+        }
+
+        // On enlève un éventuel "/" final
+        let pattern = pattern.trim_end_matches('/');
+
+        if pattern.is_empty() {
+            continue;
+        }
+
+        // On ignore les règles trop génériques
+        if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+            continue;
+        }
+
+        let normalized = pattern.replace("\\", "/");
+
+        rules.push(Rule {
+            pattern: normalized,
+            mode,
         });
     }
-    Ok(entries)
+
+    Ok(rules)
 }
 
-fn is_exact_match(root: &Path, rel_path: &Path) -> bool {
-    let gitignore_path = root.join(".gitignore");
-    if let Ok(content) = fs::read_to_string(&gitignore_path) {
-        let path_str = rel_path.to_string_lossy();
-        for line in content.lines() {
-            let trimmed = line.trim();
-            
-            // Ignore empty lines and comments
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            
-            // Ignore negation rules (!)
-            let pattern = if trimmed.starts_with('!') {
-                continue;
-            } else {
-                trimmed
-            };
-            
-            // Check if the rule contains wildcards
-            if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
-                continue; // It's a generic rule
-            }
-            
-            // Check if it's an exact match
-            let normalized_pattern = pattern.trim_end_matches('/');
-            let normalized_path = path_str.trim_end_matches('/');
-            
-            // Simple exact match
-            if normalized_pattern == normalized_path {
-                return true;
-            }
-            
-            // Match with leading slash
-            if normalized_pattern == format!("/{}", normalized_path) {
-                return true;
-            }
-            
-            // Match if pattern starts with ./
-            if normalized_pattern.starts_with("./") {
-                let pattern_without_dot = &normalized_pattern[2..];
-                if pattern_without_dot == normalized_path {
-                    return true;
+/// Construit l'arbre COMPLET de tous les fichiers/répertoires (en pré-ordre).
+/// Tous les nodes démarrent avec mode = N, mark = false
+fn build_full_tree(root: &Path) -> Result<Vec<Node>> {
+    fn build_dir(
+        current: &Path,
+        root: &Path,
+        depth: usize,
+        nodes: &mut Vec<Node>,
+    ) -> Result<()> {
+        let read = fs::read_dir(current)
+            .context(format!("Reading directory {:?}", current))?;
+
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+
+        for ent in read {
+            if let Ok(e) = ent {
+                let p = e.path();
+                let name = p.file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "".into());
+                if p.is_dir() {
+                    dirs.push((p, name));
+                } else {
+                    files.push((p, name));
                 }
             }
         }
+
+        dirs.sort_by_key(|(_, n)| n.clone());
+        files.sort_by_key(|(_, n)| n.clone());
+
+        for (p, n) in dirs.into_iter().chain(files.into_iter()) {
+            let is_dir = p.is_dir();
+            let node = Node {
+                path: p.clone(),
+                name: n,
+                is_dir,
+                depth,
+                expanded: false,
+                mode: Mode::N,
+                mark: false,
+                cpt_exception: 0,
+                cpt_mixed_marks: 0,
+            };
+            nodes.push(node);
+            if is_dir {
+                build_dir(&p, root, depth + 1, nodes)?;
+            }
+        }
+        Ok(())
     }
-    false
+
+    let mut nodes = Vec::new();
+    build_dir(root, root, 0, &mut nodes)?;
+    Ok(nodes)
 }
 
-fn insert_children(nodes: &mut Vec<Node>, idx: usize, root: &Path, gi: Option<&Gitignore>) -> Result<()> {
-    let depth = nodes[idx].depth;
-    let parent_path = nodes[idx].path.clone();
-    let children = list_dir_entries(&parent_path, root, gi)?;
-    let mut insert_at = idx + 1;
-    for mut c in children {
-        c.depth = depth + 1;
-        c.expanded = false;
-        nodes.insert(insert_at, c);
-        insert_at += 1;
+/// Applique les règles du .gitignore sur l'arbre :
+/// - on applique les règles dans l'ordre (dernière règle qui matche gagne)
+/// - règle C : marque le node exact (mode=C, mark=true) et propage mark=true aux descendants
+/// - règle E : met mode=E et mark=false sur le node exact et propage mark=false aux descendants
+fn apply_rules_to_nodes(nodes: &mut Vec<Node>, root: &Path, rules: &[Rule]) {
+    let len = nodes.len();
+
+    for i in 0..len {
+        let rel = nodes[i].path.strip_prefix(root).unwrap_or(&nodes[i].path);
+        let rel_str = rel.to_string_lossy().replace("\\", "/");
+
+        // reset de base
+        nodes[i].mode = Mode::N;
+        nodes[i].mark = false;
+
+        for rule in rules {
+            let pat = &rule.pattern;
+
+            let is_exact = rel_str == *pat;
+            let is_descendant = rel_str.starts_with(pat) 
+                && rel_str.len() > pat.len() 
+                && rel_str.as_bytes()[pat.len()] == b'/';
+
+            match rule.mode {
+                Mode::C => {
+                    if is_exact {
+                        // répertoire "racine" de la règle target/*
+                        nodes[i].mode = Mode::C;
+                        nodes[i].mark = true;
+                    } else if is_descendant {
+                        // tout le sous-arbre est marqué ignoré par cette règle
+                        nodes[i].mark = true;
+                        // si un E précédent existait pour ce node, il est écrasé
+                        if nodes[i].mode == Mode::E {
+                            nodes[i].mode = Mode::N;
+                        }
+                    }
+                }
+                Mode::E => {
+                    if is_exact {
+                        // exception explicite sur ce node
+                        nodes[i].mode = Mode::E;
+                        nodes[i].mark = false;
+                    } else if is_descendant {
+                        // descendants d'une exception : ils sont aussi des exceptions
+                        nodes[i].mark = false;
+                        // on écrase un éventuel mode précédent
+                        if nodes[i].mode == Mode::C {
+                            nodes[i].mode = Mode::N;
+                        }
+                    }
+                }
+                Mode::N => {}
+            }
+        }
     }
-    Ok(())
+
+    // cpt_exception pour tout l'arbre
+    recompute_cpt_exception(nodes);
+    
+    // cpt_mixed_marks pour tout l'arbre
+    recompute_cpt_mixed_marks(nodes);
 }
 
-fn collapse_subtree(nodes: &mut Vec<Node>, idx: usize) {
-    let depth = nodes[idx].depth;
-    let mut remove_from = idx + 1;
-    while remove_from < nodes.len() && nodes[remove_from].depth > depth {
-        remove_from += 1;
+/// Recalcule cpt_exception pour tous les nodes.
+/// - fichier : 1 si mode = E, sinon 0
+/// - répertoire : (1 si mode = E) + somme récursive de tous les descendants
+fn recompute_cpt_exception(nodes: &mut Vec<Node>) {
+    for n in nodes.iter_mut() {
+        n.cpt_exception = if n.mode == Mode::E { 1 } else { 0 };
     }
-    nodes.drain(idx + 1..remove_from);
+
+    let len = nodes.len();
+    if len == 0 {
+        return;
+    }
+
+    // Comme nodes est en pré-ordre, les descendants d'un répertoire
+    // sont dans un bloc contigu après lui, avec depth plus grand.
+    for i in (0..len).rev() {
+        if nodes[i].is_dir {
+            let depth = nodes[i].depth;
+            let mut j = i + 1;
+            let mut sum = nodes[i].cpt_exception;
+            while j < len && nodes[j].depth > depth {
+                sum += nodes[j].cpt_exception;
+                j += 1;
+            }
+            nodes[i].cpt_exception = sum;
+        }
+    }
+}
+
+/// Recalcule cpt_mixed_marks pour tous les nodes.
+/// Pour un répertoire : compte le nombre total de descendants (récursif) avec une marque différente
+fn recompute_cpt_mixed_marks(nodes: &mut Vec<Node>) {
+    let len = nodes.len();
+    if len == 0 {
+        return;
+    }
+
+    // Reset tous les compteurs
+    for n in nodes.iter_mut() {
+        n.cpt_mixed_marks = 0;
+    }
+
+    // Parcours en ordre inverse (post-ordre) pour remonter les compteurs
+    for i in (0..len).rev() {
+        if nodes[i].is_dir {
+            let parent_mark = nodes[i].mark;
+            let depth = nodes[i].depth;
+            let mut j = i + 1;
+            let mut count = 0;
+            
+            while j < len && nodes[j].depth > depth {
+                // Compte si l'enfant a une marque différente
+                if nodes[j].mark != parent_mark {
+                    count += 1;
+                }
+                // Ajoute le compteur de l'enfant s'il est un répertoire
+                if nodes[j].is_dir {
+                    count += nodes[j].cpt_mixed_marks;
+                }
+                j += 1;
+            }
+            
+            nodes[i].cpt_mixed_marks = count;
+        }
+    }
+}
+
+/// Applique mark + reset des modes/cpt_exception récursivement sur un répertoire.
+/// - mark : valeur à mettre sur tous les enfants (-R)
+/// - mode des enfants : N
+/// - cpt_exception des enfants : 0
+/// - cpt_exception du répertoire : 0 (sera recalculé globalement ensuite)
+fn apply_recursive_mark_on_dir(nodes: &mut Vec<Node>, idx: usize, mark: bool) {
+    let depth = nodes[idx].depth;
+    nodes[idx].cpt_exception = 0;
+
+    let mut i = idx + 1;
+    while i < nodes.len() && nodes[i].depth > depth {
+        nodes[i].mark = mark;
+        nodes[i].mode = Mode::N;
+        nodes[i].cpt_exception = 0;
+        i += 1;
+    }
+}
+
+/// Construit la liste des indices visibles en fonction de expanded / depth.
+fn build_visible_indices(nodes: &Vec<Node>) -> Vec<usize> {
+    let mut visible = Vec::new();
+    let mut i = 0;
+    while i < nodes.len() {
+        visible.push(i);
+        if nodes[i].is_dir && !nodes[i].expanded {
+            let depth = nodes[i].depth;
+            i += 1;
+            while i < nodes.len() && nodes[i].depth > depth {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    visible
 }
 
 fn render_header(out: &mut impl Write) -> Result<()> {
-    // Draw header at lines 0 and 1 using explicit positioning
     queue!(
         out,
         cursor::MoveTo(0, 0),
@@ -164,34 +340,17 @@ fn render_header(out: &mut impl Write) -> Result<()> {
         style::ResetColor,
         style::SetAttribute(style::Attribute::Reset),
         cursor::MoveTo(0, 1),
-        terminal::Clear(ClearType::CurrentLine) // Empty separator line
+        terminal::Clear(ClearType::CurrentLine)
     )?;
     Ok(())
 }
 
-fn has_selected_children(nodes: &Vec<Node>, parent_idx: usize) -> bool {
-    let parent_path = &nodes[parent_idx].path;
-    
-    // Iterate through all nodes to find descendants
-    for n in nodes.iter() {
-        // Check if it's a descendant of the parent
-        if n.path.starts_with(parent_path) && n.path != *parent_path {
-            if n.selected && !n.locked {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn render(nodes: &Vec<Node>, cursor_pos: usize, scroll_offset: usize) -> Result<()> {
+fn render(nodes: &Vec<Node>, visible: &Vec<usize>, cursor_pos: usize, scroll_offset: usize) -> Result<()> {
     let mut out = stdout();
-    
-    // Get terminal size
+
     let (_, term_height) = terminal::size()?;
     let viewport_rows = term_height.saturating_sub(HEADER_ROWS) as usize;
-    
-    // Clear screen once and draw header
+
     queue!(
         out,
         cursor::Hide,
@@ -199,196 +358,272 @@ fn render(nodes: &Vec<Node>, cursor_pos: usize, scroll_offset: usize) -> Result<
         style::ResetColor,
         style::SetAttribute(style::Attribute::Reset)
     )?;
-    
+
     render_header(&mut out)?;
-    
-    // Calculate visible range
-    let visible_start = scroll_offset.min(nodes.len());
-    let visible_end = (visible_start + viewport_rows).min(nodes.len());
-    
-    // Display the visible portion of the tree
-    for (line_idx, i) in (visible_start..visible_end).enumerate() {
+
+    let visible_start = scroll_offset.min(visible.len());
+    let visible_end = (visible_start + viewport_rows).min(visible.len());
+
+    for (line_idx, vis_idx) in (visible_start..visible_end).enumerate() {
+        let i = visible[vis_idx];
         let n = &nodes[i];
         let y = HEADER_ROWS + line_idx as u16;
-        
-        // Position cursor and clear the line
+
         queue!(out, cursor::MoveTo(0, y), terminal::Clear(ClearType::CurrentLine))?;
-        
-        if i == cursor_pos {
+
+        if vis_idx == cursor_pos {
             queue!(out, style::SetAttribute(style::Attribute::Reverse))?;
         }
-        
-        // Indentation with a clear character
+
         for _ in 0..n.depth {
             queue!(out, style::Print("│ "))?;
         }
-        
-        // Display selection box with a different symbol for locked items
-        if n.locked {
-            queue!(
-                out,
-                style::SetForegroundColor(style::Color::DarkGrey),
-                style::Print("[X] "),
-                style::ResetColor
-            )?;
-        } else if n.selected {
+
+        if n.mark {
             queue!(out, style::Print("[x] "))?;
-        } else if n.is_dir && has_selected_children(nodes, i) {
-            queue!(out, style::Print("[/] "))?;
         } else {
             queue!(out, style::Print("[ ] "))?;
         }
-        
-        // Display name with color based on type
+
         if n.is_dir {
             let marker = if n.expanded { "▾" } else { "▸" };
-            let color = if n.locked { style::Color::DarkGrey } else { style::Color::Blue };
-            queue!(
-                out,
-                style::SetForegroundColor(color),
-                style::SetAttribute(style::Attribute::Bold),
-                style::Print(format!("{} {}", marker, n.name)),
-                style::ResetColor,
-                style::SetAttribute(style::Attribute::Reset)
-            )?;
+            let has_mixed = n.cpt_mixed_marks > 0;
+            
+            if has_mixed {
+                queue!(
+                    out,
+                    style::SetForegroundColor(style::Color::Yellow),
+                    style::SetAttribute(style::Attribute::Bold),
+                    style::Print(format!("{} {}", marker, n.name)),
+                    style::ResetColor,
+                    style::SetAttribute(style::Attribute::Reset)
+                )?;
+            } else {
+                queue!(
+                    out,
+                    style::SetForegroundColor(style::Color::Blue),
+                    style::SetAttribute(style::Attribute::Bold),
+                    style::Print(format!("{} {}", marker, n.name)),
+                    style::ResetColor,
+                    style::SetAttribute(style::Attribute::Reset)
+                )?;
+            }
         } else {
-            let color = if n.locked { style::Color::DarkGrey } else { style::Color::White };
             queue!(
                 out,
-                style::SetForegroundColor(color),
+                style::SetForegroundColor(style::Color::White),
                 style::Print(format!("  {}", n.name)),
                 style::ResetColor
             )?;
         }
-        
-        if i == cursor_pos {
+
+        if vis_idx == cursor_pos {
             queue!(out, style::SetAttribute(style::Attribute::Reset))?;
         }
     }
-    
+
     out.flush()?;
     Ok(())
 }
 
-fn main() -> Result<()> {
-    // Get directory from arguments or use "." by default
-    let args: Vec<String> = env::args().collect();
-    let root_path = if args.len() > 1 {
-        &args[1]
+/// Vérifie si un fichier devrait être ignoré selon les règles du .gitignore
+fn should_be_ignored(file_path: &str, rules: &[Rule]) -> bool {
+    let normalized = file_path.replace("\\", "/");
+    let mut should_ignore = false;
+
+    for rule in rules {
+        let pat = &rule.pattern;
+        
+        let is_exact = normalized == *pat;
+        let is_descendant = normalized.starts_with(pat) 
+            && normalized.len() > pat.len() 
+            && normalized.as_bytes()[pat.len()] == b'/';
+
+        match rule.mode {
+            Mode::C => {
+                if is_exact || is_descendant {
+                    should_ignore = true;
+                }
+            }
+            Mode::E => {
+                if is_exact || is_descendant {
+                    should_ignore = false;
+                }
+            }
+            Mode::N => {}
+        }
+    }
+
+    should_ignore
+}
+
+/// Exécute `jj file list` et désindexe les fichiers qui devraient être ignorés
+fn untrack_ignored_files(root: &Path) -> Result<()> {
+    // Exécute `jj file list`
+    let output = Command::new("jj")
+        .arg("file")
+        .arg("list")
+        .current_dir(root)
+        .output()
+        .context("Failed to execute 'jj file list'")?;
+
+    if !output.status.success() {
+        bail!("'jj file list' failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    let tracked_files = String::from_utf8_lossy(&output.stdout);
+    
+    // Parse les règles du .gitignore actuel
+    let rules = parse_gitignore(root)?;
+    
+    let mut untracked_count = 0;
+    
+    for file in tracked_files.lines() {
+        let file = file.trim();
+        if file.is_empty() {
+            continue;
+        }
+        
+        // Vérifie si le fichier devrait être ignoré
+        if should_be_ignored(file, &rules) {
+            println!("Untracking: {}", file);
+            
+            let untrack_output = Command::new("jj")
+                .arg("file")
+                .arg("untrack")
+                .arg(file)
+                .current_dir(root)
+                .output()
+                .context(format!("Failed to untrack '{}'", file))?;
+            
+            if !untrack_output.status.success() {
+                eprintln!("Warning: Failed to untrack '{}': {}", 
+                    file, 
+                    String::from_utf8_lossy(&untrack_output.stderr));
+            } else {
+                untracked_count += 1;
+            }
+        }
+    }
+    
+    if untracked_count > 0 {
+        println!("\nUntracked {} file(s) that should be ignored.", untracked_count);
     } else {
-        "."
-    };
+        println!("\nNo files to untrack.");
+    }
+    
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
+    
+    let mut root_path = ".";
+    let mut use_jj = false;
+    
+    // Parse des arguments
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-j" | "--jj" => {
+                use_jj = true;
+            }
+            arg if !arg.starts_with('-') => {
+                root_path = arg;
+            }
+            _ => {
+                bail!("Unknown argument: {}", args[i]);
+            }
+        }
+        i += 1;
+    }
     
     let root = Path::new(root_path);
-    
-    // Check that the directory exists
+
     if !root.exists() || !root.is_dir() {
         bail!("Path '{}' does not exist or is not a directory", root_path);
     }
-    
+
     let gitignore_path = root.join(".gitignore");
 
-    // Build gitignore matcher if .gitignore exists
-    let gi: Option<Gitignore> = if gitignore_path.exists() {
-        let mut matcher = GitignoreBuilder::new(root);
-        matcher.add(&gitignore_path);
-        match matcher.build() {
-            Ok(m) => Some(m),
-            Err(_) => None,
-        }
-    } else {
-        None
-    };
+    // 1) On parse le .gitignore comme liste ordonnée de règles
+    let rules = parse_gitignore(root)?;
 
-    // Start with root entries
-    let mut nodes: Vec<Node> = Vec::new();
-    let root_children = list_dir_entries(root, root, gi.as_ref())?;
-    for mut c in root_children {
-        c.depth = 0;
-        c.expanded = false;
-        nodes.push(c);
-    }
+    // 2) On construit l'arbre COMPLET (tous les fichiers, même dans les dossiers "repliés")
+    let mut nodes: Vec<Node> = build_full_tree(root)?;
+
+    // 3) On applique les règles : propagation des marks + exceptions
+    apply_rules_to_nodes(&mut nodes, root, &rules);
+
+    // 4) On recalcule les cpt_exception et cpt_mixed_marks
+    recompute_cpt_exception(&mut nodes);
+    recompute_cpt_mixed_marks(&mut nodes);
 
     enable_raw_mode()?;
-    execute!(
-        stdout(),
-        terminal::EnterAlternateScreen,
-        cursor::Hide
-    )?;
+    execute!(stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
 
-    let mut cursor_pos = 0usize;
-    let mut scroll_offset = 0usize;
-    
-    // Initial render
-    render(&nodes, cursor_pos, scroll_offset)?;
-    
+    let mut cursor_pos: usize = 0;      // index dans les visibles
+    let mut scroll_offset: usize = 0;
+
+    let mut visible = build_visible_indices(&nodes);
+    render(&nodes, &visible, cursor_pos, scroll_offset)?;
+
     loop {
-        // Wait for an event (blocking, no timeout)
         match read()? {
             Event::Key(k) => {
-                // Get terminal size for scroll calculations
                 let (_, term_height) = terminal::size()?;
-                let available_height = (term_height as usize).saturating_sub(2).max(1);
-                
+                let available_height = (term_height as usize).saturating_sub(HEADER_ROWS as usize).max(1);
+
+                // Liste des visibles AVANT de traiter la touche
+                visible = build_visible_indices(&nodes);
+                if visible.is_empty() {
+                    cursor_pos = 0;
+                    scroll_offset = 0;
+                    continue;
+                }
+                if cursor_pos >= visible.len() {
+                    cursor_pos = visible.len().saturating_sub(1);
+                }
+
+                let mut jump_to_idx: Option<usize> = None;
+
                 match k.code {
                     KeyCode::Char('q') => break,
                     KeyCode::Up => {
                         if cursor_pos > 0 {
                             cursor_pos -= 1;
-                            // Adjust scroll if cursor goes above visible area
                             if cursor_pos < scroll_offset {
                                 scroll_offset = cursor_pos;
                             }
                         }
                     }
                     KeyCode::Down => {
-                        if cursor_pos + 1 < nodes.len() {
+                        if cursor_pos + 1 < visible.len() {
                             cursor_pos += 1;
-                            // Adjust scroll if cursor goes below visible area
                             if cursor_pos >= scroll_offset + available_height {
                                 scroll_offset = cursor_pos + 1 - available_height;
                             }
                         }
                     }
                     KeyCode::Right => {
-                        if nodes[cursor_pos].is_dir && !nodes[cursor_pos].expanded {
-                            if let Err(_e) = insert_children(&mut nodes, cursor_pos, root, gi.as_ref()) {
-                                // ignore insert errors
-                            } else {
-                                nodes[cursor_pos].expanded = true;
-                            }
+                        let idx = visible[cursor_pos];
+                        if nodes[idx].is_dir && !nodes[idx].expanded {
+                            nodes[idx].expanded = true;
                         }
                     }
                     KeyCode::Left => {
-                        if nodes[cursor_pos].is_dir && nodes[cursor_pos].expanded {
-                            collapse_subtree(&mut nodes, cursor_pos);
-                            nodes[cursor_pos].expanded = false;
-                            
-                            // Adjust scroll_offset if it's now out of bounds
-                            if nodes.len() > 0 {
-                                let max_scroll = nodes.len().saturating_sub(available_height);
-                                scroll_offset = scroll_offset.min(max_scroll);
-                                
-                                // Ensure cursor is still visible
-                                if cursor_pos < scroll_offset {
-                                    scroll_offset = cursor_pos;
-                                } else if cursor_pos >= scroll_offset + available_height {
-                                    scroll_offset = cursor_pos + 1 - available_height;
-                                }
-                            }
+                        let idx = visible[cursor_pos];
+                        if nodes[idx].is_dir && nodes[idx].expanded {
+                            nodes[idx].expanded = false;
                         } else {
-                            // try to move to parent
-                            if nodes[cursor_pos].depth > 0 {
-                                let depth = nodes[cursor_pos].depth;
-                                let mut p = cursor_pos;
+                            // Aller au parent si possible
+                            let depth = nodes[idx].depth;
+                            if depth > 0 {
+                                let mut p = idx;
                                 while p > 0 {
                                     p -= 1;
                                     if nodes[p].depth < depth {
-                                        cursor_pos = p;
-                                        // Adjust scroll if needed
-                                        if cursor_pos < scroll_offset {
-                                            scroll_offset = cursor_pos;
-                                        }
+                                        jump_to_idx = Some(p);
                                         break;
                                     }
                                 }
@@ -396,91 +631,203 @@ fn main() -> Result<()> {
                         }
                     }
                     KeyCode::Enter => {
-                        // toggle select for this node (only if not locked)
-                        if !nodes[cursor_pos].locked {
-                            nodes[cursor_pos].selected = !nodes[cursor_pos].selected;
+                        if visible.is_empty() {
+                            continue;
                         }
+
+                        let idx = visible[cursor_pos];
+                        let was_marked = nodes[idx].mark;
+                        let is_dir = nodes[idx].is_dir;
+
+                        if !was_marked {
+                            // mark : false -> true
+                            nodes[idx].mark = true;
+
+                            match nodes[idx].mode {
+                                Mode::E => {
+                                    nodes[idx].mode = Mode::N;
+                                }
+                                Mode::N => {
+                                    nodes[idx].mode = Mode::C;
+                                }
+                                Mode::C => {}
+                            }
+
+                            if is_dir {
+                                apply_recursive_mark_on_dir(&mut nodes, idx, true);
+                            }
+                        } else {
+                            // mark : true -> false
+                            nodes[idx].mark = false;
+
+                            match nodes[idx].mode {
+                                Mode::N => {
+                                    nodes[idx].mode = Mode::E;
+                                }
+                                Mode::C => {
+                                    nodes[idx].mode = Mode::N;
+                                }
+                                Mode::E => {}
+                            }
+
+                            if is_dir {
+                                apply_recursive_mark_on_dir(&mut nodes, idx, false);
+                            }
+                        }
+
+                        // Recalcul global des compteurs
+                        recompute_cpt_exception(&mut nodes);
+                        recompute_cpt_mixed_marks(&mut nodes);
                     }
                     KeyCode::Char('s') => {
-                        // Read existing .gitignore content if it exists
                         let existing_content = if gitignore_path.exists() {
                             fs::read_to_string(&gitignore_path)
                                 .context("Reading existing .gitignore")?
                         } else {
                             String::new()
                         };
-                        
-                        // Split content into lines
-                        let mut lines: Vec<String> = existing_content
-                            .lines()
-                            .map(|s| s.to_string())
-                            .collect();
-                        
-                        // For each node, handle addition or removal
+
+                        let mut lines: Vec<String> =
+                            existing_content.lines().map(|s| s.to_string()).collect();
+
+                        use std::collections::HashSet;
+                        let mut to_remove: HashSet<String> = HashSet::new();
+
+                        // On prépare les variantes à supprimer
                         for n in &nodes {
-                            // Ignore locked nodes (generic rules)
-                            if n.locked {
+                            let rel = n.path.strip_prefix(root).unwrap_or(&n.path);
+                            let mut entry = rel.to_string_lossy().to_string();
+                            if entry.is_empty() {
                                 continue;
                             }
-                            
+                            entry = entry.replace("\\", "/");
+
+                            let base = entry.clone();
+                            to_remove.insert(base.clone());
+                            to_remove.insert(format!("{base}/*"));
+                            to_remove.insert(format!("!{base}"));
+                            to_remove.insert(format!("!{base}/*"));
+                        }
+
+                        // On garde les lignes qui ne nous concernent pas
+                        lines.retain(|line| {
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() || trimmed.starts_with('#') {
+                                return true;
+                            }
+                            !to_remove.contains(trimmed)
+                        });
+
+                        // On ajoute les nouvelles règles selon mode / cpt_exception
+                        for n in &nodes {
                             let rel = n.path.strip_prefix(root).unwrap_or(&n.path);
-                            let entry = rel.to_string_lossy().to_string();
-                            
-                            // Check if the entry already exists
-                            let existing_index = lines.iter().position(|line| {
-                                line.trim() == entry.trim()
-                            });
-                            
-                            if n.selected {
-                                // Add if not already present
-                                if existing_index.is_none() {
-                                    lines.push(entry);
+                            let mut entry = rel.to_string_lossy().to_string();
+                            if entry.is_empty() {
+                                continue;
+                            }
+                            entry = entry.replace("\\", "/");
+
+                            match n.mode {
+                                Mode::N => {
+                                    // RÉPERTOIRE "normal" mais qui contient au moins une exception
+                                    // -> on veut :
+                                    // !entry
+                                    // entry/*
+                                    //
+                                    // Exemple : target/test
+                                    // résultat :
+                                    // !target/test
+                                    // target/test/*
+                                    if n.is_dir && n.cpt_exception > 0 {
+                                        lines.push(format!("!{}", entry));
+                                        lines.push(format!("{entry}/*"));
+                                    }
                                 }
-                            } else {
-                                // Remove if present
-                                if let Some(idx) = existing_index {
-                                    lines.remove(idx);
+                                Mode::C => {
+                                    // Règle d'ignore classique
+                                    // - si c'est un dossier avec des exceptions -> entry/*
+                                    // - sinon -> entry
+                                    if n.is_dir && n.cpt_exception > 0 {
+                                        lines.push(format!("{entry}/*"));
+                                    } else {
+                                        lines.push(entry);
+                                    }
+                                }
+                                Mode::E => {
+                                    // Exception explicite
+                                    lines.push(format!("!{}", entry));
                                 }
                             }
                         }
-                        
-                        // Rebuild content with remaining lines
-                        let mut new_content = lines.join("\n");
+
+                        let mut new_content = String::new();
+                        for (i, line) in lines.iter().enumerate() {
+                            if i > 0 {
+                                new_content.push('\n');
+                            }
+                            new_content.push_str(line);
+                        }
                         if !new_content.is_empty() && !new_content.ends_with('\n') {
                             new_content.push('\n');
                         }
-                        
+
                         fs::write(&gitignore_path, new_content)
                             .context("Writing .gitignore")?;
                         break;
                     }
-                    _ => continue, // Don't render for unknown keys
+                    _ => {}
                 }
-                
-                // Ensure scroll_offset stays within valid bounds
-                if nodes.len() > 0 {
-                    let max_scroll = nodes.len().saturating_sub(available_height);
+
+                // Après modification, on recalcule les visibles et on corrige le curseur / scroll
+                visible = build_visible_indices(&nodes);
+                if visible.is_empty() {
+                    cursor_pos = 0;
+                    scroll_offset = 0;
+                } else {
+                    if let Some(target_idx) = jump_to_idx {
+                        if let Some(new_row) = visible.iter().position(|&i| i == target_idx) {
+                            cursor_pos = new_row;
+                        }
+                    }
+
+                    if cursor_pos >= visible.len() {
+                        cursor_pos = visible.len().saturating_sub(1);
+                    }
+
+                    let max_scroll = visible.len().saturating_sub(available_height);
+                    if cursor_pos < scroll_offset {
+                        scroll_offset = cursor_pos;
+                    } else if cursor_pos >= scroll_offset + available_height {
+                        scroll_offset = cursor_pos + 1 - available_height;
+                    }
                     scroll_offset = scroll_offset.min(max_scroll);
                 }
-                
-                // Render only after handling a key action
-                render(&nodes, cursor_pos, scroll_offset)?;
+
+                render(&nodes, &visible, cursor_pos, scroll_offset)?;
             }
             Event::Resize(_, _) => {
-                // Redraw when terminal is resized
-                render(&nodes, cursor_pos, scroll_offset)?;
+                visible = build_visible_indices(&nodes);
+                render(&nodes, &visible, cursor_pos, scroll_offset)?;
             }
             _ => {}
         }
     }
 
-    execute!(
-        stdout(),
-        cursor::Show,
-        terminal::LeaveAlternateScreen
-    )?;
+    execute!(stdout(), cursor::Show, terminal::LeaveAlternateScreen)?;
     disable_raw_mode()?;
 
-    println!("Selection completed. The `.gitignore` file has been updated in '{}'.", root_path);
+    println!(
+        "Selection completed. The `.gitignore` file has been updated in '{}'.",
+        root_path
+    );
+    
+    // Si l'option -j est activée, on désindexe les fichiers ignorés
+    if use_jj {
+        println!("\nChecking tracked files with jj...");
+        if let Err(e) = untrack_ignored_files(root) {
+            eprintln!("Error while untracking files: {}", e);
+        }
+    }
+    
     Ok(())
 }
